@@ -4,6 +4,7 @@ import glob
 import zipfile
 from datetime import date, timedelta
 import pandas as pd
+import numpy as np
 import streamlit as st
 import yfinance as yf
 
@@ -51,6 +52,13 @@ st.markdown(
         border-radius: 8px;
         margin-bottom: 15px;
     }
+    .supertrend-box {
+        background-color: #FEF3C7;
+        border: 1px solid #FCD34D;
+        padding: 15px;
+        border-radius: 8px;
+        margin-bottom: 15px;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -63,7 +71,7 @@ os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 # Main Title Header
 st.markdown('<div class="main-title">📈 Stock Screener & Yahoo Finance Exporter</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-title">Download stock data from yfinance, save to server storage, and run custom Moving Average bulk screening logic!</div>',
+    '<div class="sub-title">Download stock data from yfinance, save to server storage, and run custom Moving Average + Supertrend (8, 3.2) bulk screening!</div>',
     unsafe_allow_html=True,
 )
 
@@ -134,6 +142,79 @@ def fetch_and_clean_data(ticker_symbol: str, start: date, end: date, freq: str):
     return data_reset, data
 
 
+# Helper function: Compute Supertrend indicator
+def calculate_supertrend(df: pd.DataFrame, period: int = 8, multiplier: float = 3.2):
+    if len(df) < period + 1 or not all(c in df.columns for c in ["High", "Low", "Close"]):
+        return None, None
+
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    close = df["Close"].astype(float)
+
+    # 1. Calculate True Range (TR)
+    hl = high - low
+    hc = (high - close.shift(1)).abs()
+    lc = (low - close.shift(1)).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+
+    # 2. Calculate ATR using Wilder's smoothing
+    atr = tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
+
+    hl2 = (high + low) / 2.0
+    basic_ub = hl2 + (multiplier * atr)
+    basic_lb = hl2 - (multiplier * atr)
+
+    final_ub = basic_ub.copy()
+    final_lb = basic_lb.copy()
+    supertrend = pd.Series(np.nan, index=df.index)
+    direction = pd.Series(0, index=df.index)
+
+    start_idx = period
+    if start_idx >= len(df):
+        return None, None
+
+    final_ub.iloc[start_idx] = basic_ub.iloc[start_idx]
+    final_lb.iloc[start_idx] = basic_lb.iloc[start_idx]
+
+    if close.iloc[start_idx] <= final_ub.iloc[start_idx]:
+        supertrend.iloc[start_idx] = final_ub.iloc[start_idx]
+        direction.iloc[start_idx] = -1
+    else:
+        supertrend.iloc[start_idx] = final_lb.iloc[start_idx]
+        direction.iloc[start_idx] = 1
+
+    for i in range(start_idx + 1, len(df)):
+        # Final Upper Band
+        if basic_ub.iloc[i] < final_ub.iloc[i - 1] or close.iloc[i - 1] > final_ub.iloc[i - 1]:
+            final_ub.iloc[i] = basic_ub.iloc[i]
+        else:
+            final_ub.iloc[i] = final_ub.iloc[i - 1]
+
+        # Final Lower Band
+        if basic_lb.iloc[i] > final_lb.iloc[i - 1] or close.iloc[i - 1] < final_lb.iloc[i - 1]:
+            final_lb.iloc[i] = basic_lb.iloc[i]
+        else:
+            final_lb.iloc[i] = final_lb.iloc[i - 1]
+
+        # Direction and Supertrend Value
+        if supertrend.iloc[i - 1] == final_ub.iloc[i - 1]:
+            if close.iloc[i] <= final_ub.iloc[i]:
+                supertrend.iloc[i] = final_ub.iloc[i]
+                direction.iloc[i] = -1
+            else:
+                supertrend.iloc[i] = final_lb.iloc[i]
+                direction.iloc[i] = 1
+        else:
+            if close.iloc[i] >= final_lb.iloc[i]:
+                supertrend.iloc[i] = final_lb.iloc[i]
+                direction.iloc[i] = 1
+            else:
+                supertrend.iloc[i] = final_ub.iloc[i]
+                direction.iloc[i] = -1
+
+    return supertrend, direction
+
+
 # Helper function to save df to server CSV
 def save_data_to_server(df_reset: pd.DataFrame, symbol: str, start: date, end: date, freq: str):
     safe_sym = "".join(c for c in symbol if c.isalnum() or c in ("-", "_", ".")).rstrip()
@@ -158,7 +239,7 @@ def extract_symbols_from_file(uploaded_file):
                 input_df = pd.read_csv(uploaded_file, encoding="latin1")
 
         input_df.columns = [str(c).strip() for c in input_df.columns]
-        
+
         # Find symbol column
         candidate_cols = [c for c in input_df.columns if c.strip().lower() == "symbol"]
         symbol_col = candidate_cols[0] if candidate_cols else input_df.columns[0]
@@ -181,29 +262,29 @@ def extract_symbols_from_file(uploaded_file):
 
 # Create Navigation Tabs
 tab_screener, tab_batch, tab_single = st.tabs([
-    "🎯 Bulk Moving Average Screener",
+    "🎯 Bulk Screener (MA + Supertrend)",
     "📁 Bulk CSV Downloader & Server Storage",
     "🔍 Single Symbol Downloader",
 ])
 
 # ==========================================
-# TAB 1: BULK MOVING AVERAGE SCREENER
+# TAB 1: BULK MOVING AVERAGE & SUPERTREND SCREENER
 # ==========================================
 with tab_screener:
-    st.subheader("⚡ Bulk Stock Screener using Moving Average")
+    st.subheader("⚡ Bulk Stock Screener (Moving Average + Supertrend)")
     st.write(
-        "Screen stocks using your custom Moving Average condition. "
-        "Upload a bulk list of stocks, choose your Moving Average period, target value, and operator (`>`, `<`, `=`)."
+        "Screen stocks using your custom Moving Average condition combined with the **Supertrend (8, 3.2)** filter. "
+        "Upload a bulk list of stocks or use server-saved files."
     )
 
-    # Screener Input Controls
-    st.markdown('<div class="filter-box"><b>🔧 Screener Condition Configuration</b></div>', unsafe_allow_html=True)
-    
+    # Moving Average Screener Input Controls
+    st.markdown('<div class="filter-box"><b>1️⃣ Moving Average Filter Settings</b></div>', unsafe_allow_html=True)
+
     col_c1, col_c2, col_c3, col_c4 = st.columns(4)
 
     with col_c1:
         ma_period = st.number_input(
-            "Moving Average Window (Days/Bars)",
+            "Moving Average Window",
             min_value=2,
             max_value=500,
             value=20,
@@ -258,7 +339,40 @@ with tab_screener:
             max_value=10.0,
             value=0.5,
             step=0.1,
-            help="Allowed percentage difference for 'Equal To' condition (e.g. 0.5% tolerance)",
+            help="Allowed percentage difference for 'Equal To' condition",
+        )
+
+    # Supertrend Screener Input Controls
+    st.markdown('<div class="supertrend-box"><b>2️⃣ Supertrend Filter Settings (Default: Period=8, Multiplier=3.2)</b></div>', unsafe_allow_html=True)
+
+    col_st1, col_st2, col_st3 = st.columns(3)
+
+    with col_st1:
+        supertrend_choice = st.selectbox(
+            "Supertrend Position Filter",
+            options=["Off / Ignore Supertrend", "Above Supertrend", "Below Supertrend"],
+            index=1,
+            help="Filter stocks based on whether Close price is Above or Below the Supertrend line",
+        )
+
+    with col_st2:
+        st_period = st.number_input(
+            "Supertrend ATR Period",
+            min_value=1,
+            max_value=100,
+            value=8,
+            step=1,
+            help="ATR Period for Supertrend calculation (Default: 8)",
+        )
+
+    with col_st3:
+        st_multiplier = st.number_input(
+            "Supertrend Multiplier",
+            min_value=0.1,
+            max_value=20.0,
+            value=3.2,
+            step=0.1,
+            help="Multiplier for Supertrend calculation (Default: 3.2)",
         )
 
     st.markdown("---")
@@ -318,6 +432,87 @@ with tab_screener:
                 status_placeholder = st.empty()
                 results = []
 
+                # Helper to evaluate single dataframe against MA and Supertrend
+                def evaluate_stock_df(df_stock, symbol_name, source_name):
+                    if "Close" not in df_stock.columns or len(df_stock) < max(ma_period, st_period + 1):
+                        return {
+                            "Symbol": symbol_name,
+                            "Status": f"⚠️ Insufficient rows (<{max(ma_period, st_period+1)})",
+                            "Match": False,
+                            "Latest Close": None,
+                            f"{ma_period}-{ma_type[:3]} Value": None,
+                            f"Supertrend ({st_period}, {st_multiplier})": None,
+                            "Supertrend Position": "-",
+                            "MA Condition": "-",
+                            "Data Source": source_name,
+                        }
+
+                    close_series = df_stock["Close"].astype(float)
+                    if "EMA" in ma_type:
+                        ma_series = close_series.ewm(span=ma_period, adjust=False).mean()
+                    else:
+                        ma_series = close_series.rolling(window=ma_period).mean()
+
+                    latest_close = float(close_series.iloc[-1])
+                    latest_ma = float(ma_series.iloc[-1])
+
+                    # 1. Evaluate MA condition
+                    if compare_mode == "Latest Close Price vs MA Value":
+                        val_a, val_b = latest_close, latest_ma
+                        label_a, label_b = "Latest Close", f"{ma_period}-MA"
+                    elif compare_mode == "Latest MA Value vs User Input Target":
+                        val_a, val_b = latest_ma, float(target_user_val)
+                        label_a, label_b = f"Latest {ma_period}-MA", "Target Value"
+                    else:
+                        val_a, val_b = latest_close, float(target_user_val)
+                        label_a, label_b = "Latest Close", "Target Value"
+
+                    diff = val_a - val_b
+                    diff_pct = abs(diff / val_b) * 100 if val_b != 0 else 0
+
+                    if "Greater Than" in operator_choice:
+                        ma_match = val_a > val_b
+                    elif "Less Than" in operator_choice:
+                        ma_match = val_a < val_b
+                    else:
+                        ma_match = diff_pct <= tolerance_pct
+
+                    # 2. Evaluate Supertrend condition
+                    st_val = None
+                    st_pos = "N/A"
+                    st_match = True
+
+                    if supertrend_choice != "Off / Ignore Supertrend":
+                        st_series, st_dir = calculate_supertrend(df_stock, period=st_period, multiplier=st_multiplier)
+                        if st_series is not None and not pd.isna(st_series.iloc[-1]):
+                            st_val = float(st_series.iloc[-1])
+                            st_direction = int(st_dir.iloc[-1])
+                            st_pos = "Above Supertrend (Bullish)" if st_direction == 1 else "Below Supertrend (Bearish)"
+
+                            if supertrend_choice == "Above Supertrend":
+                                st_match = (st_direction == 1)
+                            elif supertrend_choice == "Below Supertrend":
+                                st_match = (st_direction == -1)
+                        else:
+                            st_match = False
+                            st_pos = "Error/Insufficient Data"
+
+                    final_match = ma_match and st_match
+
+                    return {
+                        "Symbol": symbol_name,
+                        "Status": "✅ Pass" if final_match else "❌ Fail",
+                        "Match": final_match,
+                        "MA Match": ma_match,
+                        "Supertrend Match": st_match,
+                        "Latest Close": round(latest_close, 2),
+                        f"{ma_period}-{ma_type[:3]} Value": round(latest_ma, 2),
+                        f"Supertrend ({st_period}, {st_multiplier})": round(st_val, 2) if st_val is not None else None,
+                        "Supertrend Position": st_pos,
+                        "MA Condition": f"{label_a} {operator_choice.split()[0]} {label_b}",
+                        "Data Source": source_name,
+                    }
+
                 if use_server_cache:
                     server_files = glob.glob(os.path.join(DOWNLOADS_DIR, "*.csv"))
                     total_items = len(server_files)
@@ -328,63 +523,8 @@ with tab_screener:
                         try:
                             df_cached = pd.read_csv(fpath)
                             sym = fname.split("_")[0]
-
-                            if "Close" in df_cached.columns and len(df_cached) >= ma_period:
-                                close_series = df_cached["Close"].astype(float)
-                                if "EMA" in ma_type:
-                                    ma_series = close_series.ewm(span=ma_period, adjust=False).mean()
-                                else:
-                                    ma_series = close_series.rolling(window=ma_period).mean()
-
-                                latest_close = float(close_series.iloc[-1])
-                                latest_ma = float(ma_series.iloc[-1])
-
-                                # Determine values for comparison
-                                if compare_mode == "Latest Close Price vs MA Value":
-                                    val_a, val_b = latest_close, latest_ma
-                                    label_a, label_b = "Latest Close", f"{ma_period}-MA"
-                                elif compare_mode == "Latest MA Value vs User Input Target":
-                                    val_a, val_b = latest_ma, float(target_user_val)
-                                    label_a, label_b = f"Latest {ma_period}-MA", "Target Value"
-                                else:
-                                    val_a, val_b = latest_close, float(target_user_val)
-                                    label_a, label_b = "Latest Close", "Target Value"
-
-                                # Check condition
-                                match = False
-                                diff = val_a - val_b
-                                diff_pct = abs(diff / val_b) * 100 if val_b != 0 else 0
-
-                                if "Greater Than" in operator_choice:
-                                    match = val_a > val_b
-                                elif "Less Than" in operator_choice:
-                                    match = val_a < val_b
-                                else:
-                                    match = diff_pct <= tolerance_pct
-
-                                results.append({
-                                    "Symbol": sym,
-                                    "Status": "✅ Pass" if match else "❌ Fail",
-                                    "Match": match,
-                                    "Latest Close": round(latest_close, 2),
-                                    f"{ma_period}-{ma_type[:3]} Value": round(latest_ma, 2),
-                                    "Compared Value A": round(val_a, 2),
-                                    "Compared Value B": round(val_b, 2),
-                                    "Condition": f"{label_a} {operator_choice.split()[0]} {label_b}",
-                                    "Data Source": "Server CSV",
-                                })
-                            else:
-                                results.append({
-                                    "Symbol": sym,
-                                    "Status": f"⚠️ Insufficient rows (<{ma_period})",
-                                    "Match": False,
-                                    "Latest Close": None,
-                                    f"{ma_period}-{ma_type[:3]} Value": None,
-                                    "Compared Value A": None,
-                                    "Compared Value B": None,
-                                    "Condition": "-",
-                                    "Data Source": "Server CSV",
-                                })
+                            res = evaluate_stock_df(df_cached, sym, "Server CSV")
+                            results.append(res)
                         except Exception as e:
                             results.append({
                                 "Symbol": fname,
@@ -392,9 +532,9 @@ with tab_screener:
                                 "Match": False,
                                 "Latest Close": None,
                                 f"{ma_period}-{ma_type[:3]} Value": None,
-                                "Compared Value A": None,
-                                "Compared Value B": None,
-                                "Condition": "-",
+                                f"Supertrend ({st_period}, {st_multiplier})": None,
+                                "Supertrend Position": "-",
+                                "MA Condition": "-",
                                 "Data Source": "Server CSV",
                             })
                         progress_bar.progress((idx + 1) / total_items)
@@ -404,65 +544,14 @@ with tab_screener:
                     for idx, sym in enumerate(symbols_to_screen):
                         status_placeholder.info(f"⏳ Fetching & Screening ({idx+1}/{total_items}): **{sym}**...")
                         try:
-                            res = fetch_and_clean_data(sym, start_date, end_date, interval)
-                            if res is not None:
-                                df_reset, df_raw = res
-                                # Save to server for caching & testing purpose
+                            res_clean = fetch_and_clean_data(sym, start_date, end_date, interval)
+                            if res_clean is not None:
+                                df_reset, df_raw = res_clean
+                                # Save to server storage for testing purpose
                                 save_data_to_server(df_reset, sym, start_date, end_date, interval)
 
-                                if "Close" in df_raw.columns and len(df_raw) >= ma_period:
-                                    close_series = df_raw["Close"].astype(float)
-                                    if "EMA" in ma_type:
-                                        ma_series = close_series.ewm(span=ma_period, adjust=False).mean()
-                                    else:
-                                        ma_series = close_series.rolling(window=ma_period).mean()
-
-                                    latest_close = float(close_series.iloc[-1])
-                                    latest_ma = float(ma_series.iloc[-1])
-
-                                    if compare_mode == "Latest Close Price vs MA Value":
-                                        val_a, val_b = latest_close, latest_ma
-                                        label_a, label_b = "Latest Close", f"{ma_period}-MA"
-                                    elif compare_mode == "Latest MA Value vs User Input Target":
-                                        val_a, val_b = latest_ma, float(target_user_val)
-                                        label_a, label_b = f"Latest {ma_period}-MA", "Target Value"
-                                    else:
-                                        val_a, val_b = latest_close, float(target_user_val)
-                                        label_a, label_b = "Latest Close", "Target Value"
-
-                                    diff = val_a - val_b
-                                    diff_pct = abs(diff / val_b) * 100 if val_b != 0 else 0
-
-                                    if "Greater Than" in operator_choice:
-                                        match = val_a > val_b
-                                    elif "Less Than" in operator_choice:
-                                        match = val_a < val_b
-                                    else:
-                                        match = diff_pct <= tolerance_pct
-
-                                    results.append({
-                                        "Symbol": sym,
-                                        "Status": "✅ Pass" if match else "❌ Fail",
-                                        "Match": match,
-                                        "Latest Close": round(latest_close, 2),
-                                        f"{ma_period}-{ma_type[:3]} Value": round(latest_ma, 2),
-                                        "Compared Value A": round(val_a, 2),
-                                        "Compared Value B": round(val_b, 2),
-                                        "Condition": f"{label_a} {operator_choice.split()[0]} {label_b}",
-                                        "Data Source": "yfinance API (Saved to Server)",
-                                    })
-                                else:
-                                    results.append({
-                                        "Symbol": sym,
-                                        "Status": f"⚠️ Insufficient rows (<{ma_period})",
-                                        "Match": False,
-                                        "Latest Close": None,
-                                        f"{ma_period}-{ma_type[:3]} Value": None,
-                                        "Compared Value A": None,
-                                        "Compared Value B": None,
-                                        "Condition": "-",
-                                        "Data Source": "yfinance API",
-                                    })
+                                res = evaluate_stock_df(df_raw, sym, "yfinance (Saved to Server)")
+                                results.append(res)
                             else:
                                 results.append({
                                     "Symbol": sym,
@@ -470,9 +559,9 @@ with tab_screener:
                                     "Match": False,
                                     "Latest Close": None,
                                     f"{ma_period}-{ma_type[:3]} Value": None,
-                                    "Compared Value A": None,
-                                    "Compared Value B": None,
-                                    "Condition": "-",
+                                    f"Supertrend ({st_period}, {st_multiplier})": None,
+                                    "Supertrend Position": "-",
+                                    "MA Condition": "-",
                                     "Data Source": "yfinance API",
                                 })
                         except Exception as e:
@@ -482,9 +571,9 @@ with tab_screener:
                                 "Match": False,
                                 "Latest Close": None,
                                 f"{ma_period}-{ma_type[:3]} Value": None,
-                                "Compared Value A": None,
-                                "Compared Value B": None,
-                                "Condition": "-",
+                                f"Supertrend ({st_period}, {st_multiplier})": None,
+                                "Supertrend Position": "-",
+                                "MA Condition": "-",
                                 "Data Source": "yfinance API",
                             })
 
@@ -498,7 +587,7 @@ with tab_screener:
                     failed_df = res_df[res_df["Match"] == False]
 
                     st.markdown(
-                        f'<div class="success-box">🎉 <b>Screening Completed!</b> Found <b>{len(passed_df)}</b> stocks out of <b>{len(res_df)}</b> matching your criteria.</div>',
+                        f'<div class="success-box">🎉 <b>Screening Completed!</b> Found <b>{len(passed_df)}</b> stocks out of <b>{len(res_df)}</b> matching your MA + Supertrend criteria.</div>',
                         unsafe_allow_html=True,
                     )
 
@@ -512,22 +601,24 @@ with tab_screener:
                     st.download_button(
                         label=f"⬇️ Download Filtered Stock List ({len(passed_df)} Stocks) as CSV",
                         data=passed_csv,
-                        file_name=f"Screened_Stocks_MA{ma_period}_{date.today().strftime('%Y%m%d')}.csv",
+                        file_name=f"Screened_Stocks_MA{ma_period}_ST_{supertrend_choice.replace(' ', '_')}_{date.today().strftime('%Y%m%d')}.csv",
                         mime="text/csv",
                         type="primary",
                         width="stretch",
                     )
 
                     # Display Filtered Results Table
-                    st.subheader("🎯 Filtered Stocks List (Passed Condition)")
+                    st.subheader("🎯 Filtered Stocks List (Passed Conditions)")
                     if not passed_df.empty:
-                        st.dataframe(passed_df.drop(columns=["Match"]), width="stretch", hide_index=True)
+                        cols_to_show = [c for c in passed_df.columns if c not in ["Match", "MA Match", "Supertrend Match"]]
+                        st.dataframe(passed_df[cols_to_show], width="stretch", hide_index=True)
                     else:
-                        st.warning("No stocks matched the selected screening condition.")
+                        st.warning("No stocks matched both the selected Moving Average and Supertrend conditions.")
 
                     # Full Summary Table
                     with st.expander("📊 View Complete Screening Results (All Stocks)", expanded=False):
-                        st.dataframe(res_df.drop(columns=["Match"]), width="stretch", hide_index=True)
+                        cols_to_show = [c for c in res_df.columns if c not in ["Match", "MA Match", "Supertrend Match"]]
+                        st.dataframe(res_df[cols_to_show], width="stretch", hide_index=True)
 
 
 # ==========================================
